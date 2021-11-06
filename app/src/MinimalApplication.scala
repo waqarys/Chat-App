@@ -3,7 +3,31 @@ package app
 import scalatags.Text.all._
 
 object MinimalApplication extends cask.MainRoutes {
-  var messages = Vector(("alice", "Hello World!"), ("bob", "I am cow, hear me moo"))
+  case class Message(id: Int, parent: Option[Int], name: String, msg: String)
+
+  import com.opentable.db.postgres.embedded.EmbeddedPostgres
+
+  val server = EmbeddedPostgres.builder()
+    .setDataDirectory(System.getProperty("user.home") + "/data")
+    .setCleanDataDirectory(false).setPort(5432)
+    .start()
+
+  import io.getquill._
+  import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
+
+  val pgDataSource = new org.postgresql.ds.PGSimpleDataSource()
+  pgDataSource.setUser("postgres")
+  val hikariConfig = new HikariConfig()
+  hikariConfig.setDataSource(pgDataSource)
+  val ctx = new PostgresJdbcContext(LowerCase, new HikariDataSource(hikariConfig))
+  ctx.executeAction(
+    "CREATE TABLE IF NOT EXISTS message (id serial, parent integer, name text, msg text);"
+  )
+
+  import ctx._
+
+  def messages = ctx.run(query[Message])
+
   var openConnections = Set.empty[cask.WsChannelActor]
   val bootstrap = "https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.css"
 
@@ -23,6 +47,7 @@ object MinimalApplication extends cask.MainRoutes {
           div(id := "messageList")(messageList()),
           div(id := "errorDiv", color.red),
           form(onsubmit := "submitForm(); return false")(
+            input(`type` := "text", id := "parentInput", placeholder := "Reply To (Optional)"),
             input(`type` := "text", id := "nameInput", placeholder := "User name"),
             input(`type` := "text", id := "msgInput", placeholder := "Write a message!"),
             input(`type` := "submit")
@@ -32,22 +57,34 @@ object MinimalApplication extends cask.MainRoutes {
     )
   )
 
-  def messageList() = frag(
-    for ((name, msg) <- synchronized(messages))
-      yield p(b(name), " ", msg)
-  )
+  def messageList(): Frag = {
+    val msgMap = messages.groupBy(_.parent)
+
+    def messageListFrag(parent: Option[Int] = None): Frag = frag(
+      for (msg <- msgMap.getOrElse(parent, Nil)) yield div(
+        p("#", msg.id, " ", b(msg.name), " ", msg.msg),
+        div(paddingLeft := 25)(messageListFrag(Some(msg.id)))
+      )
+    )
+
+    messageListFrag(None)
+  }
 
   @cask.postJson("/")
-  def postChatMsg(name: String, msg: String) = {
+  def postChatMsg(parent: String, name: String, msg: String) = {
     if (name == "") ujson.Obj("success" -> false, "err" -> "Name cannot be empty")
     else if (msg == "") ujson.Obj("success" -> false, "err" -> "Message cannot be empty")
-    else synchronized {
-      synchronized {
-        messages = messages :+ (name -> msg)
+    else {
+      val parentInt = parent match {
+        case "" => None
+        case n => Some(n.toInt)
       }
-      for (conn <- synchronized(openConnections)) {
-        conn.send(cask.Ws.Text(messageList().render))
-      }
+      ctx.run(
+        query[Message].insert(
+          _.parent -> lift(parentInt), _.name -> lift(name), _.msg -> lift(msg)
+        )
+      )
+      for (conn <- openConnections) conn.send(cask.Ws.Text(messageList().render))
       ujson.Obj("success" -> true, "err" -> "")
     }
   }
@@ -55,14 +92,8 @@ object MinimalApplication extends cask.MainRoutes {
   @cask.websocket("/subscribe")
   def subscribe() = cask.WsHandler { connection =>
     connection.send(cask.Ws.Text(messageList().render))
-    synchronized {
-      openConnections += connection
-    }
-    cask.WsActor { case cask.Ws.Close(_, _) =>
-      synchronized {
-        openConnections -= connection
-      }
-    }
+    openConnections += connection
+    cask.WsActor { case cask.Ws.Close(_, _) => openConnections -= connection }
   }
 
   initialize()
