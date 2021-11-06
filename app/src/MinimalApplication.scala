@@ -1,10 +1,9 @@
 package app
 
 import scalatags.Text.all._
+import scala.concurrent._, duration.Duration.Inf
 
 object MinimalApplication extends cask.MainRoutes {
-  var messages = Vector(("alice", "Hello World!"), ("bob", "I am cow, hear me moo"))
-  var openConnections = Set.empty[cask.WsChannelActor]
   val bootstrap = "https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.css"
 
   @cask.staticResources("/static")
@@ -19,49 +18,76 @@ object MinimalApplication extends cask.MainRoutes {
       ),
       body(
         div(cls := "container")(
-          h1("Scala Chat!"),
-          div(id := "messageList")(messageList()),
-          div(id := "errorDiv", color.red),
+          h1("Scala Crawler!"),
           form(onsubmit := "submitForm(); return false")(
-            input(`type` := "text", id := "nameInput", placeholder := "User name"),
-            input(`type` := "text", id := "msgInput", placeholder := "Write a message!"),
+            input(`type` := "text", id := "searchInput", placeholder := "Enter a Wikipedia title!"),
+            input(`type` := "text", id := "depthInput", placeholder := "Enter a search depth"),
             input(`type` := "submit")
-          )
+          ),
+          div(id := "resultDiv"),
+          div(id := "errorDiv", color.red),
         )
       )
     )
   )
 
-  def messageList() = frag(
-    for ((name, msg) <- synchronized(messages))
-      yield p(b(name), " ", msg)
-  )
+  def fetchLinks(title: String): Seq[String] = {
+    val resp = requests.get(
+      "https://en.wikipedia.org/w/api.php",
+      params = Seq(
+        "action" -> "query",
+        "titles" -> title,
+        "prop" -> "links",
+        "format" -> "json"
+      )
+    )
+    for {
+      page <- ujson.read(resp)("query")("pages").obj.values.toSeq
+      links <- page.obj.get("links").toSeq
+      link <- links.arr
+    } yield link("title").str
+  }
 
-  @cask.postJson("/")
-  def postChatMsg(name: String, msg: String) = {
-    if (name == "") ujson.Obj("success" -> false, "err" -> "Name cannot be empty")
-    else if (msg == "") ujson.Obj("success" -> false, "err" -> "Message cannot be empty")
-    else synchronized {
-      synchronized {
-        messages = messages :+ (name -> msg)
+  def fetchAllLinksParallel(startTitle: String,
+                            depth: Int,
+                            onResults: Set[String] => Unit,
+                            onDepth: Int => Unit): Set[String] = {
+    var seen = Set(startTitle)
+    var current = Set(startTitle)
+    for (i <- Range(0, depth)) {
+      onDepth(i)
+      val futures = for (title <- current) yield Future {
+        fetchLinks(title)
       }
-      for (conn <- synchronized(openConnections)) {
-        conn.send(cask.Ws.Text(messageList().render))
-      }
-      ujson.Obj("success" -> true, "err" -> "")
+      val nextTitleLists = futures.map(Await.result(_, Inf))
+      current = nextTitleLists.flatten.filter(!seen.contains(_))
+      onResults(current)
+      seen = seen ++ current
     }
+    seen
   }
 
   @cask.websocket("/subscribe")
   def subscribe() = cask.WsHandler { connection =>
-    connection.send(cask.Ws.Text(messageList().render))
-    synchronized {
-      openConnections += connection
-    }
-    cask.WsActor { case cask.Ws.Close(_, _) =>
-      synchronized {
-        openConnections -= connection
-      }
+    cask.WsActor {
+      case cask.Ws.Text(s"$depth0 $searchTerm") =>
+        fetchAllLinksParallel(
+          searchTerm,
+          depth0.toInt,
+          onResults = results => {
+            connection.send(
+              cask.Ws.Text(
+                div(
+                  results
+                    .toSeq
+                    .flatMap(s => Seq[Frag](" - ", a(href := s"https://en.wikipedia.org/wiki/$s")(s)))
+                    .drop(1)
+                ).render
+              )
+            )
+          },
+          onDepth = i => connection.send(cask.Ws.Text(div(b("Depth ", i + 1)).render))
+        )
     }
   }
 
